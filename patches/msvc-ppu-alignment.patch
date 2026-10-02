@@ -1,0 +1,28 @@
+diff --git a/runner/src/snes/ppu.h b/runner/src/snes/ppu.h
+index c9df036..eebe4ad 100644
+--- a/runner/src/snes/ppu.h
++++ b/runner/src/snes/ppu.h
+@@ -72,7 +72,11 @@ typedef struct PpuWsElasticSeg {
+ 
+ typedef uint16_t PpuZbufType;
+ 
++#if defined(_MSC_VER)
++typedef struct __declspec(align(8)) PpuPixelPrioBufs {
++#else
+ typedef struct PpuPixelPrioBufs {
++#endif
+   // This holds the prio in the upper 8 bits and the color in the lower 8 bits.
+   // Sized for the widescreen border; logical screen x maps to
+   // data[x + kPpuExtraLeftRight].
+@@ -82,7 +86,11 @@ typedef struct PpuPixelPrioBufs {
+   // offset aborts on ARM -- and which ones do shifts whenever a field
+   // above them grows.
+   PpuZbufType data[kPpuBufWidth];
++#if defined(_MSC_VER)
++} PpuPixelPrioBufs;
++#else
+ } __attribute__((aligned(8))) PpuPixelPrioBufs;
++#endif
+ 
+ static inline void PpuWidescreenAdjustPinnedWindowEdges(
+     int screen_left, int screen_right, int *w1l, int *w1r, int *w2l,

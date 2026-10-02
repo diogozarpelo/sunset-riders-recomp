@@ -34,6 +34,7 @@ endif()
 # Must precede the include: runner.cmake reads it to add the loader sources.
 set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL
     "Mod package loader + trusted plugins (required for every title)" FORCE)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyFrameworkPatches.cmake")
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 
 add_executable(SunsetRidersSNESRecomp

@@ -1,52 +1,11 @@
-/*
- * Sunset Riders — per-game runtime glue.
- *
- * THIS FILE IS THE PORT. Everything else the scaffold produced is layout,
- * build wiring, and packaging; this is where the actual work happens.
- *
- * The framework does not, and cannot, drive an arbitrary SNES game on its
- * own. Two responsibilities always land on the game host:
- *
- *   1. Deciding what "one frame" means for THIS title, and returning from
- *      run_frame() at that boundary. A real ROM's reset vector never
- *      returns — it enters a main loop that waits on vblank — so somebody
- *      has to choose the yield point.
- *   2. Delivering NMI/IRQ at the hardware edge (see
- *      snesrecomp/docs/FRAME_MODEL_HOSTS.md).
- *
- * What follows is the shape every working port in this ecosystem converged
- * on, built from documented bridge entry points:
- *
- *      boot from the reset vector
- *      -> deliver NMI at the vblank edge, gated on NMITIMEN
- *      -> run the guest in slices until it parks or the frame's clock is out
- *      -> service a raster IRQ whenever the comparator asserts
- *      -> rasterize the field with HDMA per line
- *
- * It is a starting point, not a finished port: a title with unusual timing
- * will need the slice loop tightened (MetalWarriorsSNESRecomp's src/mw_rtl.c
- * and GundamWingEndlessDuelSNESRecomp's src/game_rtl.c are the two most
- * developed examples, and the second walks the beam explicitly while the CPU
- * is parked). What it will NOT do is sit at a black screen doing nothing,
- * which is what a driver that delivers no interrupt always does.
- *
- * Why NMI is not gated on WAI: an earlier version of this template delivered
- * an interrupt only when interp_bridge_lle_took_wai() was true. Real titles
- * overwhelmingly wait on a WRAM flag set by their own NMI handler, not on
- * WAI — Super Metroid spins `LDA $05B4 / BNE`, Zelda 3 on $0012, Super Mario
- * World on $0010 — so that branch never fired and the guest parked forever
- * on its first vblank wait. Quiescence on a read-only cycle IS the signal
- * that only an interrupt can make progress; that is the edge to act on.
- */
-
+/* Sunset Riders: continuous guest execution across frame and interrupt waits. */
 #include "game_rtl.h"
 
 #include <stdio.h>
-#include <string.h>
-
 #include "common_cpu_infra.h"
-#include "common_rtl.h"          /* SimpleHdma_*, g_snesrecomp_last_hdmaen */
+#include "common_rtl.h"
 #include "cpu_state.h"
+#include "snes/cart.h"
 #include "snes/dma.h"
 #include "snes/interp_bridge.h"
 #include "snes/ppu.h"
@@ -55,136 +14,143 @@
 extern CpuState g_cpu;
 extern Ppu *g_ppu;
 
-/* One NTSC frame: 262 scanlines x 1364 master clocks. Bounds a productive
- * MMIO loop so it cannot run across several vblanks atomically. */
 #define GAME_MASTER_CYCLES_PER_FRAME 357368ull
+#define GAME_MAX_SLICES 4096
 
-/* How many times a frame may re-enter the guest after it parks on a poll.
- * Each slice ends at a deterministic read-only cycle or at an IRQ; the bound
- * only stops a pathological loop from spinning the host. */
-#define GAME_MAX_SLICES_PER_FRAME 64
-
-/* 0 until the first frame has booted from the reset vector. */
 static uint32_t g_resume_pc;
+static int g_waiting;
+static int g_execution_failed;
 
 static uint32_t read_vector(uint32_t addr)
 {
-    /* Read through the guest bus so a mapper or coprocessor window resolves
-     * the same way the CPU sees it. */
     uint32_t lo = snes_read(g_snes, addr);
     uint32_t hi = snes_read(g_snes, addr + 1u);
     return (hi << 8) | lo;
 }
 
-static uint32_t reset_vector(void) { return read_vector(0x00FFFCu); }
-static uint32_t nmi_vector(void)   { return read_vector(0x00FFEAu); }
-static uint32_t irq_vector(void)   { return read_vector(0x00FFEEu); }
-
-/* Run one interrupt handler to its RTI, entered as hardware enters it: the
- * frame is pushed at the PC the guest was interrupted AT, so the handler's
- * terminal RTI returns into that instruction stream. */
-static void game_run_interrupt(uint32_t vector, uint64_t frame_end)
+/* Enter an interrupt, but keep it on the same resumable guest stream.
+ * Sunset Riders can wait for another NMI while still inside the previous
+ * NMI. Running each handler atomically through RTI deadlocks that wait.
+ * The real RTI instruction restores the interrupted PC and stack in the
+ * whole-program bridge; the host never discards an unfinished handler. */
+static void enter_interrupt(uint32_t vector)
 {
     cpu_push_interrupt_frame_at(&g_cpu, g_resume_pc);
-    interp_bridge_set_master_deadline(frame_end);
-    (void)interp_bridge_run_interrupt(&g_cpu, vector);
-    /* Clearing matters: a deadline left armed stays true for every AOT block
-     * prologue afterwards, which turns every compiled body into an immediate
-     * yield-unwind. */
-    interp_bridge_set_master_deadline(0);
-    {
-        uint32_t resume = interp_bridge_lle_resume_pc();
+    g_cpu._flag_I = 1;
+    g_cpu._flag_D = 0;
+    cpu_mirrors_to_p(&g_cpu);
+    g_resume_pc = read_vector(vector);
+    g_waiting = 0;
+}
+
+static void idle_until(uint64_t deadline)
+{
+    uint64_t target = deadline;
+    uint32_t irq_clocks;
+
+    snes_sync_master_clock(g_snes, g_cpu.master_cycles);
+    irq_clocks = snes_master_clocks_until_irq(g_snes);
+    if (irq_clocks && !g_cpu._flag_I &&
+        g_cpu.master_cycles + irq_clocks + 1u < target)
+        target = g_cpu.master_cycles + irq_clocks + 1u;
+
+    g_cpu.master_cycles = target;
+    g_cpu.coprocessor_master_cycles = target;
+    snes_sync_master_clock(g_snes, target);
+    if (g_snes->cart)
+        cart_sync_coprocessors(g_snes->cart, target);
+}
+
+static void run_until(uint64_t deadline)
+{
+    int slice;
+    for (slice = 0; slice < GAME_MAX_SLICES &&
+         g_cpu.master_cycles < deadline; ++slice) {
+        int ok, parked;
+        uint32_t resume;
+
+        if (g_snes->inIrq && !g_cpu._flag_I)
+            enter_interrupt(g_cpu.emulation ? 0x00FFFEu : 0x00FFEEu);
+
+        if (g_waiting) {
+            idle_until(deadline);
+            continue;
+        }
+
+        interp_bridge_set_master_deadline(deadline);
+        ok = interp_bridge_run_until_quiescent(&g_cpu, g_resume_pc);
+        interp_bridge_set_master_deadline(0);
+        resume = interp_bridge_lle_resume_pc();
         if (resume)
             g_resume_pc = resume;
+
+        g_waiting = interp_bridge_lle_took_wai();
+        parked = interp_bridge_lle_took_quiescent();
+        if (!ok || !resume) {
+            fprintf(stderr, "[sunset] execution stopped: pc=$%06X S=$%04X\n",
+                    (unsigned)g_resume_pc, (unsigned)g_cpu.S);
+            g_execution_failed = 1;
+            return;
+        }
+        if (g_snes->inIrq && !g_cpu._flag_I)
+            continue;
+        if (g_cpu.master_cycles < deadline && (g_waiting || parked))
+            idle_until(deadline);
+    }
+    if (g_cpu.master_cycles < deadline) {
+        fprintf(stderr, "[sunset] scheduler slice limit: pc=$%06X\n",
+                (unsigned)g_resume_pc);
+        g_execution_failed = 1;
     }
 }
 
 void GameRunOneFrame(void)
 {
-    const uint64_t frame_end = g_cpu.master_cycles + GAME_MASTER_CYCLES_PER_FRAME;
-    const int booting = (g_resume_pc == 0);
-    int slice;
+    uint64_t frame_end, nmi_edge;
+    uint32_t remaining;
 
-    if (booting)
-        g_resume_pc = reset_vector();
-
-    /* Vblank edge. NMITIMEN gates it: delivering before the guest has enabled
-     * NMI would land an interrupt frame in the middle of its SEI boot
-     * sequence. Nothing is delivered on the very first frame either — reset
-     * has not run yet, so there is no instruction stream to interrupt. */
-    if (!booting && g_snes->nmiEnabled) {
-        g_snes->inNmi = true;
-        game_run_interrupt(nmi_vector(), frame_end);
-        g_snes->inNmi = false;
+    if (g_execution_failed)
+        return;
+    /* The draw callback owns HDMA. Do not consume each table a second time
+     * while advancing the beam through CPU execution. */
+    g_snes->hdmaBeamOff = true;
+    if (!g_resume_pc) {
+        g_resume_pc = read_vector(0x00FFFCu);
     }
 
-    /* Run the guest until it parks on a read-only poll (its vblank wait) or
-     * the frame's clock runs out. A single call is not enough: the guest
-     * typically parks several times per frame — on HVBJOY, on a DMA-complete
-     * flag, on its own state machine — and each park needs either an
-     * interrupt or simply more time. */
-    for (slice = 0; slice < GAME_MAX_SLICES_PER_FRAME; slice++) {
-        if (g_cpu.master_cycles >= frame_end)
-            break;
-        interp_bridge_set_master_deadline(frame_end);
-        interp_bridge_run_until_quiescent(&g_cpu, g_resume_pc);
-        interp_bridge_set_master_deadline(0);
-        {
-            uint32_t resume = interp_bridge_lle_resume_pc();
-            if (resume)
-                g_resume_pc = resume;
-        }
+    snes_sync_master_clock(g_snes, g_cpu.master_cycles);
+    remaining = snes_master_clocks_until_line(g_snes, 0);
+    frame_end = g_cpu.master_cycles +
+        (remaining ? remaining : GAME_MASTER_CYCLES_PER_FRAME);
 
-        /* A raster IRQ asserted while the guest ran: service it before
-         * continuing, exactly as the CPU samples it between instructions. */
-        if (g_snes->inIrq && !g_cpu._flag_I) {
-            game_run_interrupt(irq_vector(), frame_end);
-            continue;
+    remaining = snes_master_clocks_until_line(g_snes, 225);
+    nmi_edge = g_cpu.master_cycles + remaining;
+    if (nmi_edge < frame_end) {
+        run_until(nmi_edge);
+        if (g_execution_failed)
+            return;
+        if (g_snes->nmiEnabled) {
+            g_snes->inNmi = true;
+            enter_interrupt(g_cpu.emulation ? 0x00FFFAu : 0x00FFEAu);
         }
-        /* Parked with no interrupt pending and clock left over: the guest is
-         * waiting for the next vblank. Nothing more happens this frame. */
-        if (interp_bridge_lle_took_wai())
-            break;
     }
+    run_until(frame_end);
 }
 
 void GameDrawPpuFrame(void)
 {
     SimpleHdma hdma_chans[8];
     Dma *dma = g_snes->dma;
-    int trigger;
     int line, ch;
 
-    /* Re-arm HDMA from the last $420C (HDMAEN) the guest wrote — typically
-     * during the NMI just run. The framework records it for exactly this. */
     dma_startDma(dma, g_snesrecomp_last_hdmaen, true);
-    for (ch = 0; ch < 8; ch++)
+    for (ch = 0; ch < 8; ++ch)
         SimpleHdma_Init(&hdma_chans[ch], &dma->channel[ch]);
-
-    /* Mid-frame raster split, if the guest programmed the V comparator. */
-    trigger = g_snes->vIrqEnabled ? (int)g_snes->vTimer : -1;
-
-    /* From line 0, not line 1: starting at 1 leaves the top scanline holding
-     * the previous frame's state, which shows up as a stripe of stale
-     * tilemap above a HUD. */
-    for (line = 0; line <= 224; line++) {
-        /* HDMA runs in the H-blank BEFORE each visible line, and the raster
-         * IRQ then selects the register set that line is drawn with — so
-         * both must precede ppu_runLine for this line, not follow it. */
-        for (ch = 0; ch < 8; ch++)
+    for (line = 0; line <= 224; ++line) {
+        for (ch = 0; ch < 8; ++ch)
             SimpleHdma_DoLine(&hdma_chans[ch]);
-        if (line == trigger) {
-            g_snes->inIrq = true;
-            cpu_push_interrupt_frame_at(&g_cpu, g_resume_pc);
-            (void)interp_bridge_run_interrupt(&g_cpu, irq_vector());
-            g_snes->inIrq = false;
-            {
-                uint32_t resume = interp_bridge_lle_resume_pc();
-                if (resume)
-                    g_resume_pc = resume;
-            }
-            trigger = g_snes->vIrqEnabled ? (int)g_snes->vTimer : -1;
-        }
+        /* CPU beam timing already delivers IRQs. Drawing must not inject a
+         * second interrupt into the suspended guest instruction stream. */
         ppu_runLine(g_ppu, line);
     }
 }
@@ -199,9 +165,8 @@ const RtlGameInfo kGameInfo = {
 
 void GameSessionReset(void)
 {
-    /* Rematch / soft-return: clear anything that must not survive a new
-     * session. recomp-ai-rules/NETPLAY.md §3 — sticky state that "has always
-     * been fine" is the usual desync culprit, because single-player never
-     * re-enters the boot path twice in one process. */
     g_resume_pc = 0;
+    g_waiting = 0;
+    g_execution_failed = 0;
+    interp_bridge_set_master_deadline(0);
 }
