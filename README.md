@@ -1,6 +1,18 @@
 # Sunset Riders Recomp
 
 <p align="center">
+  <a href="https://github.com/diogozarpelo/sunset-riders-recomp/releases/download/v0.1.0-alpha/sunsetriders-0.1.0-alpha-windows-x64.zip">
+    <img src="https://img.shields.io/badge/Download-Windows_x64-0078D4?style=for-the-badge" alt="Download Sunset Riders Recomp for Windows x64">
+  </a>
+</p>
+
+<p align="center">
+  <strong>v0.1.0-alpha</strong> ? Experimental build with known issues.<br>
+  Requires your own <strong>Sunset Riders (USA)</strong> SNES ROM. No ROM is included.<br>
+  <a href="https://github.com/diogozarpelo/sunset-riders-recomp/releases">Release notes and checksums</a>
+</p>
+
+<p align="center">
   An experimental PC port of Sunset Riders for the Super Nintendo, built with SNESRecomp and a shared desktop launcher.
 </p>
 
@@ -36,13 +48,13 @@ This is an unofficial project. The original game's ROM and assets are not includ
 
 ## Status
 
-**Early alpha, intended for testing and continued development.** The first public release is planned as **v0.1.0-alpha**.
+**v0.1.0-alpha: intended for testing and continued development.**
 
 The game has been **tested through the full campaign** on Windows x64. Normal life loss and Game Over behavior were also verified.
 
 Known visual problems remain, and one reported issue may affect gameplay. Full campaign completion does not imply exhaustive validation of every character, multiplayer mode, configuration, or platform.
 
-The ROM-free setup package still requires validation from a clean installation before it can be recommended as the primary installation method.
+The Windows setup pack has been tested after extraction into a separate folder, including tool setup, ROM selection, code generation, local rebuilding, and gameplay. Validation on a Windows machine without development tools installed remains pending.
 
 ## Supported ROM
 
@@ -64,6 +76,25 @@ The hashes identify the supported image; a matching filename alone does not esta
 The authoritative identity is stored in [`rom_identity.txt`](rom_identity.txt) and shared by the build, generation script, and packaging script.
 
 **No ROM is provided, and this repository does not link to ROM downloads.**
+
+## Download and play
+
+Use the **Windows x64 download button at the top of this page**. Download the release ZIP rather than GitHub's **Source code** archive.
+
+1. Extract the entire ZIP into a folder where you have write permission.
+2. Open `SunsetRidersSNESRecomp.exe` from the extracted folder.
+3. Complete the portable build-tool setup if the launcher requests it. Internet access is required for downloads during initial setup.
+4. Select your own compatible **Sunset Riders (USA)** ROM.
+5. Choose **Generate & rebuild** and wait for local generation and compilation to finish. A console window may appear during this step.
+6. When the rebuilt launcher opens, select **Play**.
+
+Keep the extracted source tree and runtime files together during setup. Afterwards, the playable executable is under the package's `build/` directory; its precise subdirectory depends on the compiler selected by the launcher. Keep its accompanying runtime files alongside it.
+
+The distributed ZIP is a setup pack. ROM-derived files are produced only on your machine and are not part of the download. Do not redistribute the ROM or the generated game code.
+
+The setup guide requests approximately **2 GB of free disk space during the build**. Initial setup takes longer than subsequent launches.
+
+The ZIP includes the setup host's required Visual C++ runtime dependency and third-party license notices. `SHA256SUMS.txt` accompanies the release for download verification.
 
 ## Installation and local build
 
@@ -157,7 +188,7 @@ The intended package contains a setup host, project sources, and recompiler tool
 
 A setup host is distinct from the playable executable produced by the local build above. The packaging script requires a build configured with `-DSNESRECOMP_SETUP_HOST=ON` and no generated game translation units.
 
-End-to-end setup-pack installation is still pending validation. Until that flow has been tested, use the source-build instructions above. Download instructions for a published package will be added when that package is available and verified.
+The extracted Windows setup pack has been manually validated through ROM selection, generation, rebuilding, and gameplay. The source-build instructions above remain available for contributors. Validation on another Windows machine without development tools is still pending.
 
 ## Known issues
 
@@ -217,14 +248,14 @@ Manual validation on Windows x64 includes:
 - Normal life loss and Game Over behavior.
 - Wireless Xbox Series X controller detection and use.
 
-The MSVC build also succeeds with the compatibility patch integrated into CMake. Fresh-install packaging, broader controller coverage, multiplayer, and exhaustive character testing remain to be validated.
+The MSVC build also succeeds with the compatibility patch integrated into CMake. The extracted setup pack was also tested through local generation, rebuilding, and normal gameplay with video, audio, controller input, and normal life loss. Testing on a separate machine without development tools, broader controller coverage, multiplayer, and exhaustive character testing remain pending.
 
 ## Roadmap
 
 - Investigate train-stage pole placement and collision behavior.
 - Correct fire rendering in the Dark Horse and final stages.
 - Correct intro and saloon animation glitches.
-- Validate the setup pack from a clean Windows environment.
+- Validate the setup pack on another Windows machine without development tools installed.
 - Expand character, controller, and multiplayer testing.
 - Add real launcher and gameplay screenshots.
 - Improve runtime integration and progressively expand recompiled coverage.
